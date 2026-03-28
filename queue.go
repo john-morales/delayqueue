@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"container/list"
 	"context"
+	"slices"
 	"sync"
 	"time"
 )
@@ -19,9 +20,10 @@ type Queue[T any] struct {
 	additions chan item[T]
 	items     pqueue[T]
 
-	readyLock   sync.Mutex
-	readySignal *sync.Cond
-	ready       list.List
+	readyLock    sync.Mutex
+	readySignal  *sync.Cond
+	ready        list.List
+	readyResorts int
 }
 
 // Create a new Queue that will run until the provided context is cancelled.
@@ -49,14 +51,40 @@ func (q *Queue[T]) dispatch() {
 		for q.ready.Len() == 0 {
 			q.readySignal.Wait()
 		}
-		i := q.ready.Remove(q.ready.Front()).(T)
+		i := q.ready.Remove(q.ready.Front()).(item[T])
 		q.readyLock.Unlock()
+
 		select {
-		case q.ch <- i:
+		case q.ch <- i.V:
 		case <-q.ctx.Done():
 			return
 		}
 	}
+}
+
+// Must be holding readyLock
+func (q *Queue[T]) sortReadyList() {
+	if q.ready.Len() < 2 {
+		return
+	}
+
+	// ready queue items out of order, resort
+	items := make([]item[T], 0, q.ready.Len())
+	for e := q.ready.Front(); e != nil; e = e.Next() {
+		items = append(items, e.Value.(item[T]))
+	}
+
+	// sort
+	slices.SortFunc(items, func(i, j item[T]) int {
+		return i.Due.Compare(j.Due)
+	})
+
+	// add back to ready List in sorted order
+	q.ready.Init()
+	for _, i := range items {
+		q.ready.PushBack(i)
+	}
+	q.readyResorts++
 }
 
 // Run the queue, processing new additions and emitting existing items as
@@ -92,8 +120,19 @@ func (q *Queue[T]) run() {
 			} else {
 				nextDueAt = time.Time{}
 			}
+
 			q.readyLock.Lock()
-			q.ready.PushBack(out.V)
+			q.ready.PushBack(out)
+
+			// List always sorted, so only need to check if last item is out of order compared to
+			// second last item
+			if q.ready.Len() > 1 {
+				secondLastItem := q.ready.Back().Prev().Value.(item[T])
+				lastItem := q.ready.Back().Value.(item[T])
+				if lastItem.Due.Before(secondLastItem.Due) {
+					q.sortReadyList()
+				}
+			}
 			q.readyLock.Unlock()
 			q.readySignal.Signal()
 		case <-q.ctx.Done():
@@ -113,6 +152,19 @@ func (q *Queue[T]) Add(due time.Time, i T) error {
 	case q.additions <- item[T]{Due: due, V: i}:
 		return nil
 	}
+}
+
+// Resorts returns the total number of in-memory sort operations performed by this delay queue
+// on its internal queue of items whose deadline have elapsed, but are still in line to be offered
+// to the output channel C. The need for this resorting is dependent on the workload pattern
+// of queue producers vs queue consumers. In short, resorting can be more likely when there are
+// delays in consuming the channel combined with new items regularly being Add()'ed with earlier
+// deadlines. This counter is exposed for diagnostic observability purposes only.
+func (q *Queue[T]) Resorts() int {
+	q.readyLock.Lock()
+	resorts := q.readyResorts
+	q.readyLock.Unlock()
+	return resorts
 }
 
 type item[T any] struct {
